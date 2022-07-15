@@ -1,4 +1,4 @@
-module dendenmushi
+module github.com/heyfgirl/dendenmushi-go
 
 go 1.15
 
