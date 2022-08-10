@@ -1,4 +1,4 @@
-package dendenmushi
+package codec
 
 import (
 	"bufio"

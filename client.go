@@ -1,107 +1,99 @@
 package dendenmushi
 
 import (
-	"bufio"
-	"io"
+	"context"
+	"net"
 	"net/rpc"
-	"strings"
-	"sync"
 
-	"github.com/vmihailenco/msgpack/v5"
+	codec "github.com/heyfgirl/dendenmushi-go/codec"
+	"github.com/heyfgirl/dendenmushi-go/pool"
 )
 
-type clientCodec struct {
-	r        io.Reader
-	w        io.Writer
-	c        io.Closer
-	mutex    sync.Mutex        // protects pending
-	pending  map[uint64]string // map request id to method name
-	shutdown chan error
-	body     *msgpack.RawMessage
+// stater client 客户端
+type stater struct {
+	client   *(rpc.Client)
+	shutdown bool
 }
 
-// NewClientCodec Create a new client codec
-func NewClientCodec(conn io.ReadWriteCloser, shutdown chan error) rpc.ClientCodec {
-	return &clientCodec{
-		r:        bufio.NewReader(conn),
-		w:        bufio.NewWriter(conn),
-		c:        conn,
-		pending:  make(map[uint64]string),
-		shutdown: shutdown,
-	}
-}
-
-// 阻塞获取 socket头数据信息
-func (c *clientCodec) ReadResponseHeader(r *rpc.Response) error {
-	// // 读取 header
-	// 解析body 按 upyun rpc的格式化解析
-	type upResponseFormat struct {
-		ID   uint64              `msgpack:"id"`
-		Type string              `msgpack:"type"`
-		Body *msgpack.RawMessage `msgpack:"result"`
-	}
-	result := upResponseFormat{}
-	err := read(c.r, &result)
+// dial connects to a  server at the specified network address.
+func createConn(network, address string) (*stater, error) {
+	d := &net.Dialer{}
+	ctx := context.Background()
+	conn, err := d.DialContext(ctx, network, address)
 	if err != nil {
-		// 网络断开
-		if err == io.EOF {
-			c.shutdown <- err
+		return nil, err
+	}
+	shutdown := make(chan error)
+	c := &stater{
+		shutdown: false,
+		client:   rpc.NewClientWithCodec(codec.NewClientCodec(conn, shutdown)),
+	}
+	go func() {
+		select {
+		case <-shutdown:
+			c.shutdown = true
 		}
+	}()
+	return c, err
+}
+
+//PoolClient 连接池客户端 dendenmushi
+type PoolClient struct {
+	pool pool.Pool
+}
+
+// Call 方法
+func (c *PoolClient) Call(serviceMethod string, args interface{}, reply interface{}) error {
+	v, err := c.pool.Get()
+	if err != nil {
+		// 获取连接失败
 		return err
 	}
-	c.body = result.Body
-	replyErr := ""
-	if result.Type == "error" {
-		err := msgpack.Unmarshal(*c.body, &replyErr)
-		if err != nil {
-			return err
+	client := v.(*stater)
+	err = client.client.Call(serviceMethod, args, &reply)
+	if err != nil {
+		c.pool.Close(v)
+	}
+	// 用完返还
+	c.pool.Put(v)
+	return err
+}
+
+// NewClient 创建客户端
+func NewClient(network, address string, config *pool.Config) (*PoolClient, error) {
+	if config == nil {
+		config = &pool.Config{
+			InitialCap: 0,
+			MaxIdle:    5,
+			MaxCap:     30,
 		}
 	}
-	// 设置返回头信息
-	c.mutex.Lock()
-	r.Seq = result.ID
-	if replyErr != "" {
-		r.Error = replyErr
+	poolConfig := &pool.Config{
+		InitialCap: config.InitialCap,
+		MaxIdle:    config.MaxIdle,
+		MaxCap:     config.MaxCap,
+		Factory: func() (interface{}, error) {
+			c, err := createConn(network, address)
+			return c, err
+		},
+		Close: func(v interface{}) error {
+			return v.(*stater).client.Close()
+		},
+		IdleTimeout: config.IdleTimeout,
+		Ping: func(v interface{}) error { //检查是否还处于连接状态
+			client := v.(*stater)
+			if client.shutdown {
+				return rpc.ErrShutdown
+			}
+			return nil
+		},
 	}
-	r.ServiceMethod = c.pending[r.Seq]
-	delete(c.pending, r.Seq)
-	c.mutex.Unlock()
-
-	return nil
-}
-
-// 获取头成功之后的 body获取，
-func (c *clientCodec) ReadResponseBody(reply interface{}) error {
-	if reply == nil {
-		return nil
-	}
-	return msgpack.Unmarshal(*c.body, reply)
-}
-
-// 写数据方法
-func (c *clientCodec) WriteRequest(r *rpc.Request, param interface{}) error {
-	c.mutex.Lock()
-	c.pending[r.Seq] = r.ServiceMethod
-	c.mutex.Unlock()
-	var Method = r.ServiceMethod
-
-	pointIndex := strings.Index(Method, ".")
-	var ServiceName string = Method[0:pointIndex]
-	var MethodName string = Method[pointIndex+1:]
-	var Params = param
-	var ID = r.Seq
-	// 对数据进行格式化
-	// 写入头长度
-	params := make([]interface{}, 0)
-	params = append(params, ID, "call", ServiceName, MethodName, Params)
-	b, err := msgpack.Marshal(&params)
+	p, err := pool.NewChannelPool(poolConfig)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	return write(c.w, b)
-}
-
-// 关闭code
-func (c *clientCodec) Close() error {
-	return c.c.Close()
+	poolclient := &PoolClient{
+		pool: p,
+	}
+	return poolclient, nil
 }
