@@ -1,11 +1,12 @@
 package main
 
 import (
-	codec "dendenmushi"
 	"fmt"
 	"log"
 	"net"
 	"net/rpc"
+
+	codec "github.com/heyfgirl/dendenmushi-go/codec"
 )
 
 const HelloServiceName = "path/to/pkg.HelloService"
